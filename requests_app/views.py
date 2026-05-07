@@ -2,6 +2,8 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Count
+from django.http import HttpResponse
+from django.utils import timezone
 from .models import (Requester, Status, Platform, Request,
                      Approval, Attachment, Publication, ProcessingLog)
 from .serializers import (RequesterSerializer, StatusSerializer,
@@ -12,6 +14,12 @@ from logs.utils import log_action
 from notifications.utils import send_notification
 from django.contrib.auth import get_user_model
 from users.permissions import IsStaffOrAdmin, IsOwnerOrStaff
+import openpyxl
+from openpyxl.styles import Font, Alignment
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from io import BytesIO
 
 User = get_user_model()
 
@@ -135,6 +143,140 @@ class RequestViewSet(viewsets.ModelViewSet):
             })
 
         return Response(formatted_stats)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsStaffOrAdmin])
+    def export_excel(self, request):
+        """
+        Exports all requests to an Excel spreadsheet.
+        """
+        queryset = self.get_queryset()
+        
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "PIO Requests"
+        
+        # Define headers
+        headers = [
+            'Request ID', 'Agency/Requester', 'Contact Person', 
+            'Barangay', 'Request Type', 'Status', 'Submitted At'
+        ]
+        
+        # Style headers
+        for col_num, column_title in enumerate(headers, 1):
+            cell = sheet.cell(row=1, column=col_num)
+            cell.value = column_title
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal='center')
+            
+        # Add data
+        for row_num, obj in enumerate(queryset, 2):
+            sheet.cell(row=row_num, column=1).value = obj.request_id
+            sheet.cell(row=row_num, column=2).value = obj.requester.agency_name
+            sheet.cell(row=row_num, column=3).value = obj.requester.contact_person
+            sheet.cell(row=row_num, column=4).value = obj.requester.get_barangay_display()
+            sheet.cell(row=row_num, column=5).value = obj.get_request_type_display()
+            sheet.cell(row=row_num, column=6).value = obj.status.status_name if obj.status else 'Pending'
+            sheet.cell(row=row_num, column=7).value = obj.submitted_at.strftime('%Y-%m-%d %H:%M')
+            
+        # Adjust column widths
+        for col in sheet.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            sheet.column_dimensions[column].width = adjusted_width
+
+        response = HttpResponse(
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = f'attachment; filename=PIO_Requests_{timezone.now().strftime("%Y%m%d")}.xlsx'
+        workbook.save(response)
+        
+        log_action(request.user, 'EXPORT EXCEL', 'Exported requests to Excel')
+        return response
+
+    @action(detail=True, methods=['get'], permission_classes=[IsOwnerOrStaff])
+    def export_pdf(self, request, pk=None):
+        """
+        Generates a PDF report for a specific request.
+        """
+        obj = self.get_object()
+        buffer = BytesIO()
+        p = canvas.Canvas(buffer, pagesize=letter)
+        width, height = letter
+        
+        # Header
+        p.setFont("Helvetica-Bold", 16)
+        p.drawCentredString(width/2, height - 50, "PUBLIC INFORMATION OFFICE (PIO)")
+        p.setFont("Helvetica", 12)
+        p.drawCentredString(width/2, height - 70, "Gumaca, Quezon, Philippines")
+        p.line(50, height - 80, width - 50, height - 80)
+        
+        # Request Info
+        p.setFont("Helvetica-Bold", 14)
+        p.drawString(50, height - 110, f"OFFICIAL REQUEST REPORT #{obj.request_id}")
+        
+        p.setFont("Helvetica-Bold", 11)
+        p.drawString(50, height - 140, "REQUESTER DETAILS")
+        p.setFont("Helvetica", 11)
+        p.drawString(60, height - 160, f"Agency/Name: {obj.requester.agency_name}")
+        p.drawString(60, height - 175, f"Contact Person: {obj.requester.contact_person}")
+        p.drawString(60, height - 190, f"Contact Number: {obj.requester.contact_number}")
+        p.drawString(60, height - 205, f"Address: {obj.requester.address}, {obj.requester.get_barangay_display()}")
+        
+        p.setFont("Helvetica-Bold", 11)
+        p.drawString(50, height - 235, "REQUEST INFORMATION")
+        p.setFont("Helvetica", 11)
+        p.drawString(60, height - 255, f"Type: {obj.get_request_type_display()}")
+        p.drawString(60, height - 270, f"Status: {obj.status.status_name if obj.status else 'Pending'}")
+        p.drawString(60, height - 285, f"Submitted At: {obj.submitted_at.strftime('%B %d, %Y %I:%M %p')}")
+        
+        p.setFont("Helvetica-Bold", 11)
+        p.drawString(50, height - 315, "DETAILS / DESCRIPTION")
+        p.setFont("Helvetica", 11)
+        text_object = p.beginText(60, height - 335)
+        text_object.setFont("Helvetica", 11)
+        # Wrap text manually or use platypus for better wrapping
+        details = obj.details or "No details provided."
+        lines = [details[i:i+85] for i in range(0, len(details), 85)]
+        for line in lines:
+            text_object.textLine(line)
+        p.drawText(text_object)
+        
+        # Approvals
+        p.setFont("Helvetica-Bold", 11)
+        curr_y = height - 450
+        p.drawString(50, curr_y, "APPROVAL STATUS")
+        curr_y -= 20
+        approvals = obj.approvals.all()
+        if approvals:
+            for app in approvals:
+                p.setFont("Helvetica", 11)
+                p.drawString(60, curr_y, f"Status: {app.approval_status.upper()}")
+                p.drawString(60, curr_y - 15, f"Remarks: {app.remarks or 'No remarks'}")
+                p.drawString(60, curr_y - 30, f"Processed By: {app.approved_by.username if app.approved_by else 'N/A'}")
+                curr_y -= 50
+        else:
+            p.drawString(60, curr_y, "Status: PENDING REVIEW")
+            
+        # Footer
+        p.setFont("Helvetica-Oblique", 9)
+        p.drawCentredString(width/2, 50, f"Generated on {timezone.now().strftime('%Y-%m-%d %H:%M:%S')} - Archive-PIO System")
+        
+        p.showPage()
+        p.save()
+        
+        buffer.seek(0)
+        log_action(request.user, 'EXPORT PDF', f'Generated PDF for Request #{obj.request_id}')
+        
+        response = HttpResponse(buffer, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename=Request_{obj.request_id}_Report.pdf'
+        return response
 
 
 class ApprovalViewSet(viewsets.ModelViewSet):
